@@ -1,0 +1,19 @@
+[package]
+name = "sret"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.46.1", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yml = "0.0.12"
+clap = { version = "4.5.41", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+rand = "0.9.1"
+anyhow = "1.0.98"
+reqwest = { version = "0.12.22", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"
