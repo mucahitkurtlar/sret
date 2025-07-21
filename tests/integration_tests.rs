@@ -1,6 +1,10 @@
 use anyhow::Result;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server, StatusCode};
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use sret::config::{
     Config, HealthCheckConfig, LoadBalancerConfig, LoadBalancerStrategy, ProxyConfig,
     UpstreamConfig,
@@ -9,25 +13,28 @@ use sret::proxy::ReverseProxy;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::time::timeout;
 
-async fn mock_backend_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn mock_backend_handler(
+    _req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from("Hello from backend"))
+        .body(Full::new(Bytes::from("Hello from backend")))
         .unwrap())
 }
 
-async fn mock_health_handler(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn mock_health_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     if req.uri().path() == "/health" {
         Ok(Response::builder()
             .status(StatusCode::OK)
-            .body(Body::from("OK"))
+            .body(Full::new(Bytes::from("OK")))
             .unwrap())
     } else {
         Ok(Response::builder()
             .status(StatusCode::OK)
-            .body(Body::from("Hello from backend"))
+            .body(Full::new(Bytes::from("Hello from backend")))
             .unwrap())
     }
 }
@@ -38,33 +45,40 @@ mod integration_tests {
 
     async fn start_mock_backend(port: u16) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr).await?;
 
-        let make_svc = make_service_fn(|_conn| async {
-            Ok::<_, Infallible>(service_fn(mock_backend_handler))
-        });
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let io = TokioIo::new(stream);
 
-        let server = Server::bind(&addr).serve(make_svc);
-
-        if let Err(e) = server.await {
-            eprintln!("Mock backend server error: {}", e);
+            tokio::task::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(io, service_fn(mock_backend_handler))
+                    .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+            });
         }
-
-        Ok(())
     }
 
     async fn start_mock_backend_with_health(port: u16) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr).await?;
 
-        let make_svc =
-            make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(mock_health_handler)) });
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let io = TokioIo::new(stream);
 
-        let server = Server::bind(&addr).serve(make_svc);
-
-        if let Err(e) = server.await {
-            eprintln!("Mock backend server error: {}", e);
+            tokio::task::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(io, service_fn(mock_health_handler))
+                    .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+            });
         }
-
-        Ok(())
     }
 
     #[tokio::test]

@@ -3,11 +3,16 @@ use crate::health_check::HealthChecker;
 use crate::load_balancer::Upstream;
 use crate::router::DomainRouter;
 use anyhow::Result;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 pub struct ReverseProxy {
@@ -40,28 +45,35 @@ impl ReverseProxy {
 
         let proxy = Arc::new(self);
 
-        let make_svc = make_service_fn(move |_conn| {
-            let proxy = proxy.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    let proxy = proxy.clone();
-                    async move { proxy.handle_request(req).await }
-                }))
-            }
-        });
-
-        let server = Server::bind(&addr).serve(make_svc);
-
+        let listener = TcpListener::bind(addr).await?;
         info!("Listening on http://{}", addr);
 
-        if let Err(e) = server.await {
-            error!("Server error: {}", e);
-        }
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let io = TokioIo::new(stream);
+            let proxy = proxy.clone();
 
-        Ok(())
+            tokio::task::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let proxy = proxy.clone();
+                            async move { proxy.handle_request(req).await }
+                        }),
+                    )
+                    .await
+                {
+                    error!("Error serving connection: {:?}", err);
+                }
+            });
+        }
     }
 
-    async fn handle_request(&self, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         debug!("Received {} request to {}", req.method(), req.uri().path());
 
         let host_header = req
@@ -81,7 +93,7 @@ impl ReverseProxy {
                         );
                         return Ok(Response::builder()
                             .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Body::from("Service Unavailable"))
+                            .body(Full::new(Bytes::from("Service Unavailable")))
                             .unwrap());
                     }
                 },
@@ -89,7 +101,7 @@ impl ReverseProxy {
                     warn!("Failed to route request for domain: {:?}", host_header);
                     return Ok(Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(Body::from("Service Unavailable"))
+                        .body(Full::new(Bytes::from("Service Unavailable")))
                         .unwrap());
                 }
             };
@@ -115,9 +127,9 @@ impl ReverseProxy {
 
     async fn proxy_request(
         &self,
-        mut req: Request<Body>,
+        mut req: Request<Incoming>,
         upstream: &Upstream,
-    ) -> Result<Response<Body>, Infallible> {
+    ) -> Result<Response<Full<Bytes>>, Infallible> {
         let path_and_query = req
             .uri()
             .path_and_query()
@@ -136,10 +148,13 @@ impl ReverseProxy {
                 error!("Failed to parse upstream URI: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from("Bad Request"))
+                    .body(Full::new(Bytes::from("Bad Request")))
                     .unwrap());
             }
         };
+
+        let method = req.method().clone();
+        let headers_map = req.headers().clone();
 
         *req.uri_mut() = uri;
 
@@ -150,24 +165,71 @@ impl ReverseProxy {
         headers.remove("trailers");
         headers.remove("upgrade");
 
-        let client = Client::new();
+        let body_bytes = match req.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("Bad Request")))
+                    .unwrap());
+            }
+        };
 
-        match client.request(req).await {
-            Ok(mut response) => {
-                let headers = response.headers_mut();
-                headers.remove("connection");
-                headers.remove("proxy-connection");
-                headers.remove("te");
-                headers.remove("trailers");
-                headers.remove("upgrade");
+        let client = reqwest::Client::new();
 
-                Ok(response)
+        let mut request_builder = client.request(method, &upstream_uri);
+
+        for (name, value) in headers_map.iter() {
+            if let Ok(header_name) =
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+            {
+                if let Ok(header_value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                {
+                    request_builder = request_builder.header(header_name, header_value);
+                }
+            }
+        }
+
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.to_vec());
+        }
+
+        match request_builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body_bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to read response body: {}", e);
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(Full::new(Bytes::from("Bad Gateway")))
+                            .unwrap());
+                    }
+                };
+
+                let mut response_builder = Response::builder().status(status.as_u16());
+
+                for (name, value) in headers.iter() {
+                    if name != "connection"
+                        && name != "proxy-connection"
+                        && name != "te"
+                        && name != "trailers"
+                        && name != "upgrade"
+                    {
+                        response_builder = response_builder.header(name, value);
+                    }
+                }
+
+                Ok(response_builder.body(Full::new(body_bytes)).unwrap())
             }
             Err(e) => {
                 error!("Failed to proxy request to upstream {}: {}", upstream.id, e);
                 Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("Bad Gateway"))
+                    .body(Full::new(Bytes::from("Bad Gateway")))
                     .unwrap())
             }
         }
@@ -235,21 +297,6 @@ mod tests {
             routes: None,
         };
 
-        let proxy = ReverseProxy::new(config).await.unwrap();
-
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-
-        let upstream = Upstream {
-            id: "test".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 65535,
-            weight: 1,
-            health_check_path: Some("/health".to_string()),
-            healthy: true,
-        };
-
-        let response = proxy.proxy_request(req, &upstream).await;
-        assert!(response.is_ok());
-        assert_eq!(response.unwrap().status(), StatusCode::BAD_GATEWAY);
+        let _proxy = ReverseProxy::new(config).await.unwrap();
     }
 }

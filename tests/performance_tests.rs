@@ -1,6 +1,10 @@
 use anyhow::Result;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server, StatusCode};
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use sret::config::{
     Config, HealthCheckConfig, LoadBalancerConfig, LoadBalancerStrategy, ProxyConfig,
     UpstreamConfig,
@@ -11,15 +15,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 static REQUEST_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-async fn counting_backend_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn counting_backend_handler(
+    _req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let count = REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(format!("Response #{}", count)))
+        .body(Full::new(Bytes::from(format!("Response #{}", count))))
         .unwrap())
 }
 
@@ -29,18 +36,21 @@ mod performance_tests {
 
     async fn start_counting_backend(port: u16) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr).await?;
 
-        let make_svc = make_service_fn(|_conn| async {
-            Ok::<_, Infallible>(service_fn(counting_backend_handler))
-        });
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let io = TokioIo::new(stream);
 
-        let server = Server::bind(&addr).serve(make_svc);
-
-        if let Err(e) = server.await {
-            eprintln!("Counting backend server error: {}", e);
+            tokio::task::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(io, service_fn(counting_backend_handler))
+                    .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+            });
         }
-
-        Ok(())
     }
 
     #[tokio::test]
