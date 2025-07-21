@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use sret::{config::Config, proxy::ReverseProxy};
 use std::path::PathBuf;
-use tracing::{info, Level};
+use tracing::{Level, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "sret")]
