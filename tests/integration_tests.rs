@@ -1,298 +1,460 @@
-use anyhow::Result;
-use http_body_util::Full;
-use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use sret::config::{
-    Config, HealthCheckConfig, LoadBalancerConfig, LoadBalancerStrategy, ProxyConfig,
-    UpstreamConfig,
-};
-use sret::proxy::ReverseProxy;
-use std::convert::Infallible;
+use hyper::{Method, StatusCode};
+use sret::config::{Config, HealthCheckConfig, LoadBalancerStrategy};
+use sret::server::Server;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::time::timeout;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
-async fn mock_backend_handler(
-    _req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .body(Full::new(Bytes::from("Hello from backend")))
-        .unwrap())
-}
+const BACKEND_PORT_1: u16 = 18080;
+const BACKEND_PORT_2: u16 = 18081;
+const BACKEND_PORT_HEALTH: u16 = 18085;
+const CONSOLE_PORT: u16 = 13000;
+const CONSOLE_PORT_TEST: u16 = 33000;
 
-async fn mock_health_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    if req.uri().path() == "/health" {
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("OK")))
-            .unwrap())
-    } else {
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("Hello from backend")))
-            .unwrap())
-    }
-}
+const PATH_TEST_BACKEND_1: u16 = 28080;
+const PATH_TEST_BACKEND_2: u16 = 28081;
+const POST_TEST_BACKEND: u16 = 48080;
 
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
+const DEFAULT_PROXY_PORT: u16 = 18000;
+const DOMAIN_UNMATCHED_PROXY_PORT: u16 = 18005;
+const HEALTH_CHECK_PROXY_PORT: u16 = 18006;
+const PATH_TEST_PROXY_PORT: u16 = 28000;
+const CONSOLE_TEST_PROXY_PORT: u16 = 38000;
+const POST_TEST_PROXY_PORT: u16 = 48000;
+const UNMATCHED_ROUTE_PROXY_PORT: u16 = 58000;
 
-    async fn start_mock_backend(port: u16) -> Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = TcpListener::bind(addr).await?;
+const BACKEND_STARTUP_DELAY_MS: u64 = 100;
+const PROXY_STARTUP_DELAY_MS: u64 = 200;
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service_fn(mock_backend_handler))
-                    .await
-                {
-                    eprintln!("Error serving connection: {:?}", err);
-                }
-            });
-        }
-    }
-
-    async fn start_mock_backend_with_health(port: u16) -> Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = TcpListener::bind(addr).await?;
-
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service_fn(mock_health_handler))
-                    .await
-                {
-                    eprintln!("Error serving connection: {:?}", err);
-                }
-            });
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proxy_basic_functionality() {
-        let backend_port = 13000;
-        let proxy_port = 18080;
-
-        tokio::spawn(async move {
-            if let Err(e) = start_mock_backend(backend_port).await {
-                eprintln!("Failed to start mock backend: {}", e);
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: proxy_port,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
+fn create_test_config() -> Config {
+    Config {
+        upstreams: vec![
+            sret::config::UpstreamConfig {
+                id: "backend".to_string(),
+                targets: vec![
+                    sret::config::TargetConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: BACKEND_PORT_1,
+                        weight: Some(1),
+                        health_check_path: Some("/health".to_string()),
+                    },
+                    sret::config::TargetConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: BACKEND_PORT_2,
+                        weight: Some(2),
+                        health_check_path: Some("/health".to_string()),
+                    },
+                ],
+                strategy: Some(LoadBalancerStrategy::RoundRobin),
                 health_check: Some(HealthCheckConfig {
                     interval_seconds: 30,
                     timeout_seconds: 5,
                     expected_status: 200,
                 }),
             },
-            upstreams: vec![UpstreamConfig {
-                id: "backend1".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: backend_port,
-                weight: 1,
-                health_check_path: Some("/health".to_string()),
-            }],
-            routes: None,
-        };
-
-        let proxy = ReverseProxy::new(config).await.unwrap();
-        tokio::spawn(async move {
-            if let Err(e) = proxy.start().await {
-                eprintln!("Proxy error: {}", e);
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let client = reqwest::Client::new();
-        let proxy_url = format!("http://127.0.0.1:{}/", proxy_port);
-
-        let result = timeout(Duration::from_secs(5), client.get(&proxy_url).send()).await;
-
-        match result {
-            Ok(Ok(response)) => {
-                assert!(response.status().is_success());
-                let body = response.text().await.unwrap();
-                assert_eq!(body, "Hello from backend");
-            }
-            Ok(Err(e)) => {
-                eprintln!("Request failed (expected in some test environments): {}", e);
-            }
-            Err(_) => {
-                eprintln!("Request timed out (expected in some test environments)");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_proxy_with_multiple_backends() {
-        let backend_port1 = 13001;
-        let backend_port2 = 13002;
-        let proxy_port = 18081;
-
-        tokio::spawn(async move {
-            if let Err(e) = start_mock_backend(backend_port1).await {
-                eprintln!("Failed to start mock backend 1: {}", e);
-            }
-        });
-
-        tokio::spawn(async move {
-            if let Err(e) = start_mock_backend(backend_port2).await {
-                eprintln!("Failed to start mock backend 2: {}", e);
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: proxy_port,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 30,
-                    timeout_seconds: 5,
-                    expected_status: 200,
-                }),
-            },
-            upstreams: vec![
-                UpstreamConfig {
-                    id: "backend1".to_string(),
+            sret::config::UpstreamConfig {
+                id: "console".to_string(),
+                targets: vec![sret::config::TargetConfig {
                     host: "127.0.0.1".to_string(),
-                    port: backend_port1,
-                    weight: 1,
-                    health_check_path: Some("/health".to_string()),
+                    port: CONSOLE_PORT,
+                    weight: Some(1),
+                    health_check_path: None,
+                }],
+                strategy: None,
+                health_check: None,
+            },
+        ],
+        servers: vec![sret::config::ServerConfig {
+            id: "test-server".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            port: DEFAULT_PROXY_PORT,
+            routes: vec![
+                sret::config::RouteConfig {
+                    domains: Some(vec!["api.test.local".to_string()]),
+                    paths: None,
+                    upstream: "backend".to_string(),
                 },
-                UpstreamConfig {
-                    id: "backend2".to_string(),
-                    host: "127.0.0.1".to_string(),
-                    port: backend_port2,
-                    weight: 1,
-                    health_check_path: Some("/health".to_string()),
+                sret::config::RouteConfig {
+                    domains: None,
+                    paths: Some(vec!["/api".to_string()]),
+                    upstream: "backend".to_string(),
+                },
+                sret::config::RouteConfig {
+                    domains: None,
+                    paths: Some(vec!["/console".to_string()]),
+                    upstream: "console".to_string(),
                 },
             ],
-            routes: None,
-        };
+        }],
+    }
+}
 
-        let proxy = ReverseProxy::new(config).await.unwrap();
-        tokio::spawn(async move {
-            if let Err(e) = proxy.start().await {
-                eprintln!("Proxy error: {}", e);
-            }
-        });
+async fn start_mock_backend(port: u16) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr).await.unwrap();
+        info!("Mock backend server listening on {}", addr);
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let mut buffer = [0; 1024];
+                        match stream.readable().await {
+                            Ok(_) => {
+                                if let Ok(n) = stream.try_read(&mut buffer) {
+                                    let request = String::from_utf8_lossy(&buffer[..n]);
 
-        let client = reqwest::Client::new();
-        let proxy_url = format!("http://127.0.0.1:{}/", proxy_port);
+                                    let response = if request.contains("GET /health") {
+                                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                                    } else if request.contains("POST") {
+                                        &format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{\"message\":\"Backend response from port {}\",\"method\":\"POST\"}}",
+                                            format!("{{\"message\":\"Backend response from port {}\",\"method\":\"POST\"}}", port).len(),
+                                            port
+                                        )
+                                    } else {
+                                        &format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{\"message\":\"Backend response from port {}\",\"method\":\"GET\"}}",
+                                            format!("{{\"message\":\"Backend response from port {}\",\"method\":\"GET\"}}", port).len(),
+                                            port
+                                        )
+                                    };
 
-        for i in 0..3 {
-            let result = timeout(Duration::from_secs(2), client.get(&proxy_url).send()).await;
-
-            match result {
-                Ok(Ok(response)) => {
-                    assert!(response.status().is_success());
-                    println!("Request {} successful", i + 1);
+                                    if let Err(e) = stream.try_write(response.as_bytes()) {
+                                        warn!("Failed to write response: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("Stream read error: {}", e),
+                        }
+                    });
                 }
-                Ok(Err(e)) => {
-                    eprintln!("Request {} failed: {}", i + 1, e);
-                }
-                Err(_) => {
-                    eprintln!("Request {} timed out", i + 1);
-                }
+                Err(e) => warn!("Failed to accept connection: {}", e),
             }
         }
-    }
+    })
+}
 
-    #[tokio::test]
-    async fn test_proxy_with_health_checks() {
-        let backend_port = 13003;
-        let proxy_port = 18082;
+async fn start_mock_console(port: u16) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr).await.unwrap();
+        info!("Mock console server listening on {}", addr);
 
-        tokio::spawn(async move {
-            if let Err(e) = start_mock_backend_with_health(backend_port).await {
-                eprintln!("Failed to start mock backend with health: {}", e);
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let mut buffer = [0; 1024];
+                        match stream.readable().await {
+                            Ok(_) => {
+                                if stream.try_read(&mut buffer).is_ok() {
+                                    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nConsole service";
+                                    if let Err(e) = stream.try_write(response.as_bytes()) {
+                                        warn!("Failed to write response: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("Stream read error: {}", e),
+                        }
+                    });
+                }
+                Err(e) => warn!("Failed to accept connection: {}", e),
             }
-        });
+        }
+    })
+}
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+async fn make_request(
+    method: Method,
+    url: &str,
+    host_header: Option<&str>,
+    body: Option<&str>,
+) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let mut request_builder = client.request(method, url);
 
-        let config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: proxy_port,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 1,
-                    timeout_seconds: 1,
-                    expected_status: 200,
-                }),
-            },
-            upstreams: vec![UpstreamConfig {
-                id: "backend1".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: backend_port,
-                weight: 1,
-                health_check_path: Some("/health".to_string()),
-            }],
-            routes: None,
-        };
-
-        let proxy = ReverseProxy::new(config).await.unwrap();
-        tokio::spawn(async move {
-            if let Err(e) = proxy.start().await {
-                eprintln!("Proxy error: {}", e);
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    if let Some(host) = host_header {
+        request_builder = request_builder.header("Host", host);
     }
 
-    #[tokio::test]
-    async fn test_proxy_configuration_validation() {
-        let invalid_config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 30,
-                    timeout_seconds: 5,
-                    expected_status: 200,
-                }),
-            },
-            upstreams: vec![],
-            routes: None,
-        };
-
-        assert!(invalid_config.validate().is_err());
+    if let Some(body_content) = body {
+        request_builder = request_builder
+            .header("Content-Type", "application/json")
+            .body(body_content.to_string());
     }
+
+    let response = request_builder.send().await?;
+    let status = response.status();
+    let body_text = response.text().await?;
+
+    Ok((status, body_text))
+}
+
+#[tokio::test]
+async fn test_domain_based_routing() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let _backend1 = start_mock_backend(BACKEND_PORT_1).await;
+    let _backend2 = start_mock_backend(BACKEND_PORT_2).await;
+
+    sleep(Duration::from_millis(BACKEND_STARTUP_DELAY_MS)).await;
+
+    let config = create_test_config();
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!("http://127.0.0.1:{}/", DEFAULT_PROXY_PORT),
+        Some("api.test.local"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Backend response from port"));
+    assert!(
+        body.contains(&BACKEND_PORT_1.to_string()) || body.contains(&BACKEND_PORT_2.to_string())
+    );
+
+    println!("Domain-based routing test passed");
+}
+
+#[tokio::test]
+async fn test_path_based_routing() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let _backend1 = start_mock_backend(PATH_TEST_BACKEND_1).await;
+    let _backend2 = start_mock_backend(PATH_TEST_BACKEND_2).await;
+
+    sleep(Duration::from_millis(BACKEND_STARTUP_DELAY_MS)).await;
+
+    let mut config = create_test_config();
+    config.servers[0].port = PATH_TEST_PROXY_PORT;
+    config.upstreams[0].targets[0].port = PATH_TEST_BACKEND_1;
+    config.upstreams[0].targets[1].port = PATH_TEST_BACKEND_2;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!("http://127.0.0.1:{}/api/users", PATH_TEST_PROXY_PORT),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Backend response from port"));
+
+    println!("Path-based routing test passed");
+}
+
+#[tokio::test]
+async fn test_console_routing() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let _console = start_mock_console(CONSOLE_PORT_TEST).await;
+
+    sleep(Duration::from_millis(BACKEND_STARTUP_DELAY_MS)).await;
+
+    let mut config = create_test_config();
+    config.servers[0].port = CONSOLE_TEST_PROXY_PORT;
+    config.upstreams[1].targets[0].port = CONSOLE_PORT_TEST;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!("http://127.0.0.1:{}/console/admin", CONSOLE_TEST_PROXY_PORT),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Console service");
+
+    println!("Console routing test passed");
+}
+
+#[tokio::test]
+async fn test_post_request_with_body() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let _backend = start_mock_backend(POST_TEST_BACKEND).await;
+
+    sleep(Duration::from_millis(BACKEND_STARTUP_DELAY_MS)).await;
+
+    let mut config = create_test_config();
+    config.servers[0].port = POST_TEST_PROXY_PORT;
+    config.upstreams[0].targets[0].port = POST_TEST_BACKEND;
+    config.upstreams[0].targets[1].port = 48081;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::POST,
+        &format!("http://127.0.0.1:{}/api/create", POST_TEST_PROXY_PORT),
+        None,
+        Some(r#"{"name": "test", "value": 123}"#),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Backend response"));
+    assert!(body.contains("POST"));
+
+    println!("POST request with body test passed");
+}
+
+#[tokio::test]
+async fn test_unmatched_route_returns_404() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let mut config = create_test_config();
+    config.servers[0].port = UNMATCHED_ROUTE_PROXY_PORT;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!(
+            "http://127.0.0.1:{}/unknown/path",
+            UNMATCHED_ROUTE_PROXY_PORT
+        ),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "No matching route found");
+
+    println!("Unmatched route 404 test passed");
+}
+
+#[tokio::test]
+async fn test_unmatched_domain_returns_404() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let mut config = create_test_config();
+    config.servers[0].port = DOMAIN_UNMATCHED_PROXY_PORT;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!("http://127.0.0.1:{}/", DOMAIN_UNMATCHED_PROXY_PORT),
+        Some("unknown.domain.com"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "No matching route found");
+
+    println!("Unmatched domain 404 test passed");
+}
+
+#[tokio::test]
+async fn test_health_check_endpoint() {
+    tracing_subscriber::fmt::try_init().ok();
+
+    let _backend = start_mock_backend(BACKEND_PORT_HEALTH).await;
+
+    sleep(Duration::from_millis(BACKEND_STARTUP_DELAY_MS)).await;
+
+    let mut config = create_test_config();
+    config.servers[0].port = HEALTH_CHECK_PROXY_PORT;
+    config.upstreams[0].targets[0].port = BACKEND_PORT_HEALTH;
+
+    let server_config = &config.servers[0];
+    let server = Server::new(&config, server_config);
+    let server = Arc::new(server);
+    let server_clone = server.clone();
+
+    let _proxy_handle = tokio::spawn(async move {
+        server_clone.start().await.unwrap();
+    });
+
+    sleep(Duration::from_millis(PROXY_STARTUP_DELAY_MS)).await;
+
+    let (status, body) = make_request(
+        Method::GET,
+        &format!("http://127.0.0.1:{}/api/health", HEALTH_CHECK_PROXY_PORT),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "OK");
+
+    println!("Health check endpoint test passed");
 }
