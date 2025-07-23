@@ -1,0 +1,60 @@
+upstreams:
+  - id: "api"
+    targets:
+      - host: "127.0.0.1"
+        port: 8080
+        weight: 1
+        health_check_path: "/health"
+
+      - host: "127.0.0.1"
+        port: 8081
+        weight: 2
+        health_check_path: "/health"
+    strategy: "WeightedRoundRobin"
+    health_check:
+      interval_seconds: 30
+      timeout_seconds: 5
+      expected_status: 200
+
+  - id: "ui"
+    targets:
+      - host: "127.0.0.1"
+        port: 3000
+
+  - id: "admin"
+    targets:
+      - host: "127.0.0.1"
+        port: 3001
+
+servers:
+  - id: "main-proxy"
+    bind_address: "127.0.0.1"
+    port: 80
+    routes:
+      - domains: ["api.home.arpa"]
+        paths: ["/api", "/v1"]
+        upstream: "api"
+
+      - domains: ["app.home.arpa"]
+        upstream: "ui"
+
+      - paths: ["/admin"]
+        upstream: "admin"
+
+  - id: "https-proxy"
+    bind_address: "127.0.0.1"
+    port: 443
+    # You can use /scripts/generate-test-certs.sh to create self-signed certificates
+    tls:
+      cert_path: "./certs/server.pem"
+      key_path: "./certs/server-key.pem"
+    routes:
+      - domains: ["api.home.arpa"]
+        paths: ["/api", "/v1"]
+        upstream: "api"
+
+      - domains: ["app.home.arpa"]
+        upstream: "ui"
+
+      - paths: ["/admin"]
+        upstream: "admin"

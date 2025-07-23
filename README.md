@@ -1,10 +1,11 @@
 # sret - Rust Reverse Proxy
 
-sret is a high-performance Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, and comprehensive health monitoring.
+sret is a high-performance Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, HTTPS/TLS termination, and comprehensive health monitoring.
 
 ## Features
 
 - **Multi-Server Architecture**: Configure multiple proxy servers with different routing rules
+- **HTTPS/TLS Support**: Optional SSL/TLS termination with certificate configuration
 - **Advanced Routing**: Domain and path-based routing with flexible matching
 - **Load Balancing**: Four algorithms (Round Robin, Least Connections, Random, Weighted Round Robin)
 - **Health Monitoring**: Automatic upstream health checking with configurable intervals
@@ -207,6 +208,63 @@ upstreams:
 - Health status changes are logged for monitoring
 - Each target can have its own health check endpoint
 
+## HTTPS/TLS Support
+
+sret supports HTTPS with TLS termination using SSL certificates:
+
+```yaml
+servers:
+  - id: "https-server"
+    bind_address: "0.0.0.0"
+    port: 443
+    tls:
+      cert_path: "/path/to/certificate.pem"
+      key_path: "/path/to/private-key.pem"
+    routes:
+      - domains: ["secure.example.com"]
+        upstream: "backend"
+```
+
+**TLS Configuration**:
+
+- **cert_path**: Path to the PEM-encoded certificate file (certificate chain)
+- **key_path**: Path to the PEM-encoded private key file
+- **Protocol Support**: HTTP/1.1 over TLS
+- **Certificate Formats**: PEM format certificates and keys
+
+**Certificate Requirements**:
+
+- Certificates must be in PEM format
+- Private keys must be in PEM format (RSA or ECDSA)
+- Certificate chain should include intermediate certificates if required
+- File paths must be accessible by the sret process
+
+**Mixed HTTP/HTTPS Setup**:
+
+You can run both HTTP and HTTPS servers simultaneously:
+
+```yaml
+servers:
+  # HTTPS server
+  - id: "https"
+    bind_address: "0.0.0.0"
+    port: 443
+    tls:
+      cert_path: "/etc/ssl/certs/example.pem"
+      key_path: "/etc/ssl/private/example.key"
+    routes:
+      - domains: ["secure.example.com"]
+        upstream: "backend"
+
+  # HTTP server (for redirects or development)
+  - id: "http"
+    bind_address: "0.0.0.0"
+    port: 80
+    routes:
+      - domains: ["example.com"]
+        upstream: "backend"
+```
+
 ## Testing
 
 For detailed testing information, see [TESTING.md](TESTING.md).
@@ -319,6 +377,9 @@ servers:
   - id: "string" # Unique server identifier
     bind_address: "string" # Bind IP address
     port: number # Listen port
+    tls: # Optional: TLS/HTTPS configuration
+      cert_path: "string" # Path to PEM certificate file
+      key_path: "string" # Path to PEM private key file
     routes: # List of routing rules
       - domains: ["string"] # Optional: Domain matching
         paths: ["string"] # Optional: Path prefix matching
