@@ -55,6 +55,13 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
     pub routes: Vec<RouteConfig>,
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +141,7 @@ mod tests {
                 id: "test".to_string(),
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
+                tls: None,
                 routes: vec![RouteConfig {
                     domains: Some(vec!["example.com".to_string()]),
                     paths: None,
@@ -163,6 +171,7 @@ mod tests {
                 id: "test".to_string(),
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
+                tls: None,
                 routes: vec![RouteConfig {
                     domains: Some(vec!["example.com".to_string()]),
                     paths: None,

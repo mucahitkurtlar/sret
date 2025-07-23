@@ -228,6 +228,7 @@ mod tests {
             id: "test-server".to_string(),
             bind_address: "127.0.0.1".to_string(),
             port: 8080,
+            tls: None,
             routes: vec![
                 RouteConfig {
                     domains: Some(vec!["api.example.com".to_string()]),

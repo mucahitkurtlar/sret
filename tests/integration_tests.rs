@@ -71,6 +71,7 @@ fn create_test_config() -> Config {
             id: "test-server".to_string(),
             bind_address: "127.0.0.1".to_string(),
             port: DEFAULT_PROXY_PORT,
+            tls: None,
             routes: vec![
                 sret::config::RouteConfig {
                     domains: Some(vec!["api.test.local".to_string()]),

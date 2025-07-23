@@ -65,6 +65,7 @@ fn create_performance_config() -> Config {
             id: "perf-test-server".to_string(),
             bind_address: "127.0.0.1".to_string(),
             port: PROXY_PORT_1,
+            tls: None,
             routes: vec![
                 sret::config::RouteConfig {
                     domains: Some(vec!["api.perf.local".to_string()]),
