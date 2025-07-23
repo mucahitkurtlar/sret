@@ -1,6 +1,6 @@
 # sret - Rust Reverse Proxy
 
-sret is a high-performance Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, and comprehensive health monitoring.
+sret is a high-performance Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, HTTPS/TLS termination, and comprehensive health monitoring.
 
 ## Features
 
