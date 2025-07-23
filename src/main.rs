@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use sret::{config::Config, server::Server};
 use std::path::PathBuf;
-use tracing::{Level, info, error};
+use tracing::{Level, error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "sret")]
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     let config = Config::from_file(&args.config)?;
 
     let mut tasks = Vec::new();
-    
+
     for server_config in &config.servers {
         let server = Server::new(&config, server_config);
         let task = tokio::spawn(async move {

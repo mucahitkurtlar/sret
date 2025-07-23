@@ -46,7 +46,10 @@ impl ProxyHandler {
             }
         };
 
-        debug!("Routing request to target: {}, matched prefix: {:?}", target.id, matched_prefix);
+        debug!(
+            "Routing request to target: {}, matched prefix: {:?}",
+            target.id, matched_prefix
+        );
 
         let target_path = if let Some(prefix) = matched_prefix {
             path.strip_prefix(&prefix).unwrap_or(path)
@@ -59,7 +62,10 @@ impl ProxyHandler {
             target.host,
             target.port,
             target_path,
-            req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default()
+            req.uri()
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default()
         );
 
         debug!("Proxying to: {}", target_url);
@@ -83,7 +89,7 @@ impl ProxyHandler {
     ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
         let method = req.method().clone();
         let headers = req.headers().clone();
-        
+
         let body_bytes = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => return Err(Box::new(e)),
@@ -109,14 +115,12 @@ impl ProxyHandler {
         let response_body = response.bytes().await?;
 
         let mut response_builder = Response::builder().status(status);
-        
+
         for (name, value) in response_headers.iter() {
             response_builder = response_builder.header(name, value);
         }
 
-        Ok(response_builder
-            .body(Full::new(response_body))
-            .unwrap())
+        Ok(response_builder.body(Full::new(response_body)).unwrap())
     }
 }
 
