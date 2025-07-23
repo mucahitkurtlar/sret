@@ -1,292 +1,340 @@
-#[allow(unused_imports)]
-use crate::config::{Config, LoadBalancerStrategy, RouteConfig, UpstreamConfig};
-use crate::load_balancer::{LoadBalancer, Upstream};
+use crate::config::{Config, ServerConfig};
+use crate::target::Target;
+use crate::upstream::Upstream;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
-#[derive(Debug)]
-pub struct DomainRouter {
-    routes: HashMap<String, RouteInfo>,
-    default_load_balancer: Arc<LoadBalancer>,
-    upstreams_map: Arc<RwLock<HashMap<String, Upstream>>>,
+#[derive(Debug, Clone)]
+pub struct Router {
+    upstreams: HashMap<String, Arc<Upstream>>,
+    routes: Vec<Route>,
 }
 
-#[derive(Debug)]
-struct RouteInfo {
-    load_balancer: Arc<LoadBalancer>,
-    upstream_ids: Vec<String>,
+#[derive(Debug, Clone)]
+struct Route {
+    domains: Vec<String>,
+    paths: Vec<String>,
+    upstream_id: String,
 }
 
-impl DomainRouter {
-    pub fn new(config: &Config) -> Self {
-        let upstreams_map: HashMap<String, Upstream> = config
+impl Router {
+    pub fn new(config: &Config, server: &ServerConfig) -> Self {
+        info!("Creating router for server: {}", server.id);
+
+        let upstreams: HashMap<String, Arc<Upstream>> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.clone(), Upstream::from(u.clone())))
+            .map(|upstream_config| {
+                let upstream = Arc::new(Upstream::new(upstream_config.clone()));
+                (upstream_config.id.clone(), upstream)
+            })
             .collect();
 
-        let default_load_balancer = Arc::new(LoadBalancer::new(
-            config.load_balancer.strategy.clone(),
-            config
-                .upstreams
-                .iter()
-                .cloned()
-                .map(Upstream::from)
-                .collect(),
-        ));
+        let routes: Vec<Route> = server
+            .routes
+            .iter()
+            .map(|route_config| Route {
+                domains: route_config.domains.clone().unwrap_or_default(),
+                paths: route_config.paths.clone().unwrap_or_default(),
+                upstream_id: route_config.upstream.clone(),
+            })
+            .collect();
 
-        let mut routes = HashMap::new();
+        info!(
+            "Router created with {} upstreams and {} routes",
+            upstreams.len(),
+            routes.len()
+        );
 
-        if let Some(route_configs) = &config.routes {
-            for route_config in route_configs {
-                let route_upstreams: Vec<Upstream> = route_config
-                    .upstream_ids
-                    .iter()
-                    .filter_map(|id| upstreams_map.get(id))
-                    .cloned()
-                    .collect();
+        Self { upstreams, routes }
+    }
 
-                if !route_upstreams.is_empty() {
-                    let strategy = route_config
-                        .load_balancer_strategy
-                        .clone()
-                        .unwrap_or_else(|| config.load_balancer.strategy.clone());
+    pub fn route_request(
+        &self,
+        host: Option<&str>,
+        path: &str,
+    ) -> Option<(Arc<Target>, Option<String>)> {
+        debug!("Routing request: host={:?}, path={}", host, path);
 
-                    let route_load_balancer =
-                        Arc::new(LoadBalancer::new(strategy, route_upstreams));
+        for route in &self.routes {
+            if let Some(matched_prefix) = self.matches_route_with_prefix(route, host, path) {
+                debug!(
+                    "Found matching route for upstream: {}, matched prefix: {:?}",
+                    route.upstream_id, matched_prefix
+                );
 
-                    routes.insert(
-                        route_config.domain.clone(),
-                        RouteInfo {
-                            load_balancer: route_load_balancer,
-                            upstream_ids: route_config.upstream_ids.clone(),
-                        },
+                if let Some(upstream) = self.upstreams.get(&route.upstream_id) {
+                    if let Some(target) = upstream.select_target() {
+                        return Some((target, matched_prefix));
+                    }
+                } else {
+                    warn!(
+                        "Route references non-existent upstream: {}",
+                        route.upstream_id
                     );
                 }
             }
         }
 
-        Self {
-            routes,
-            default_load_balancer,
-            upstreams_map: Arc::new(RwLock::new(upstreams_map)),
-        }
+        debug!("No matching route found for host={:?}, path={}", host, path);
+        None
     }
 
-    pub async fn route_request(
+    fn matches_route_with_prefix(
         &self,
+        route: &Route,
         host: Option<&str>,
-    ) -> Option<(Arc<LoadBalancer>, Option<Upstream>)> {
-        let domain = host.map(|h| h.split(':').next().unwrap_or(h).to_lowercase());
+        path: &str,
+    ) -> Option<Option<String>> {
+        let domain_matches = if route.domains.is_empty() {
+            false
+        } else {
+            host.is_some_and(|h| {
+                let host_domain = h.split(':').next().unwrap_or(h).to_lowercase();
+                route
+                    .domains
+                    .iter()
+                    .any(|domain| domain.to_lowercase() == host_domain)
+            })
+        };
 
-        debug!("Routing request for domain: {:?}", domain);
+        let path_match = if route.paths.is_empty() {
+            if domain_matches { Some(None) } else { None }
+        } else {
+            route.paths.iter().find_map(|route_path| {
+                if path.starts_with(route_path) {
+                    Some(Some(route_path.clone()))
+                } else {
+                    None
+                }
+            })
+        };
 
-        if let Some(ref domain_str) = domain {
-            if let Some(route_info) = self.routes.get(domain_str) {
-                debug!("Found route for domain: {}", domain_str);
-                let upstream = route_info.load_balancer.select_upstream().await;
-                return Some((route_info.load_balancer.clone(), upstream));
+        let matches = domain_matches || path_match.is_some();
+
+        debug!(
+            "Route check - Domain: {:?} (matches: {}), Path: {} (path_match: {:?}), Overall: {}, Upstream: {}",
+            host, domain_matches, path, path_match, matches, route.upstream_id
+        );
+
+        if matches {
+            path_match.or(Some(None))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_upstream(&self, upstream_id: &str) -> Option<Arc<Upstream>> {
+        self.upstreams.get(upstream_id).cloned()
+    }
+
+    pub fn get_all_upstreams(&self) -> Vec<Arc<Upstream>> {
+        self.upstreams.values().cloned().collect()
+    }
+
+    pub fn get_all_targets(&self) -> Vec<Arc<Target>> {
+        self.upstreams
+            .values()
+            .flat_map(|upstream| upstream.all_targets().iter().cloned())
+            .collect()
+    }
+
+    pub fn find_target(&self, target_id: &str) -> Option<Arc<Target>> {
+        for upstream in self.upstreams.values() {
+            if let Some(target) = upstream.get_target(target_id) {
+                return Some(target);
             }
         }
-
-        debug!("Using default load balancer for domain: {:?}", domain);
-        let upstream = self.default_load_balancer.select_upstream().await;
-        Some((self.default_load_balancer.clone(), upstream))
+        None
     }
 
-    pub async fn increment_connections(&self, upstream_id: &str, host: Option<&str>) {
-        let domain = host.map(|h| h.split(':').next().unwrap_or(h).to_lowercase());
+    pub fn stats(&self) -> RouterStats {
+        let upstream_stats = self
+            .upstreams
+            .values()
+            .map(|upstream| upstream.stats())
+            .collect();
 
-        if let Some(domain) = domain {
-            if let Some(route_info) = self.routes.get(&domain) {
-                route_info
-                    .load_balancer
-                    .increment_connections(upstream_id)
-                    .await;
-                return;
-            }
-        }
-
-        self.default_load_balancer
-            .increment_connections(upstream_id)
-            .await;
-    }
-
-    pub async fn decrement_connections(&self, upstream_id: &str, host: Option<&str>) {
-        let domain = host.map(|h| h.split(':').next().unwrap_or(h).to_lowercase());
-
-        if let Some(domain) = domain {
-            if let Some(route_info) = self.routes.get(&domain) {
-                route_info
-                    .load_balancer
-                    .decrement_connections(upstream_id)
-                    .await;
-                return;
-            }
-        }
-
-        self.default_load_balancer
-            .decrement_connections(upstream_id)
-            .await;
-    }
-
-    pub async fn update_upstream_status(&self, upstream_id: &str, enabled: bool) {
-        self.default_load_balancer
-            .set_upstream_status(upstream_id, enabled)
-            .await;
-
-        for route_info in self.routes.values() {
-            if route_info.upstream_ids.contains(&upstream_id.to_string()) {
-                route_info
-                    .load_balancer
-                    .set_upstream_status(upstream_id, enabled)
-                    .await;
-            }
-        }
-
-        let mut upstreams_map = self.upstreams_map.write().await;
-        if let Some(upstream) = upstreams_map.get_mut(upstream_id) {
-            upstream.healthy = enabled;
+        RouterStats {
+            total_upstreams: self.upstreams.len(),
+            total_routes: self.routes.len(),
+            upstream_stats,
         }
     }
 
-    pub async fn get_all_upstreams(&self) -> Vec<Upstream> {
-        let upstreams_map = self.upstreams_map.read().await;
-        upstreams_map.values().cloned().collect()
+    pub fn has_healthy_targets(&self) -> bool {
+        self.upstreams
+            .values()
+            .any(|upstream| upstream.has_healthy_targets())
     }
+}
 
-    pub fn get_routes(&self) -> Vec<String> {
-        self.routes.keys().cloned().collect()
+#[derive(Debug)]
+pub struct RouterStats {
+    pub total_upstreams: usize,
+    pub total_routes: usize,
+    pub upstream_stats: Vec<crate::upstream::UpstreamStats>,
+}
+
+impl std::fmt::Display for RouterStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Router Stats:")?;
+        writeln!(f, "  Total upstreams: {}", self.total_upstreams)?;
+        writeln!(f, "  Total routes: {}", self.total_routes)?;
+        writeln!(f, "  Upstream details:")?;
+        for upstream in &self.upstream_stats {
+            writeln!(f, "    {}", upstream)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HealthCheckConfig, LoadBalancerConfig, ProxyConfig};
+    use crate::config::{RouteConfig, TargetConfig, UpstreamConfig};
 
-    fn create_test_config() -> Config {
-        Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 30,
-                    timeout_seconds: 5,
-                    expected_status: 200,
-                }),
-            },
+    fn create_test_config() -> (Config, ServerConfig) {
+        let config = Config {
             upstreams: vec![
                 UpstreamConfig {
-                    id: "service1".to_string(),
-                    host: "127.0.0.1".to_string(),
-                    port: 3000,
-                    weight: 1,
-                    health_check_path: Some("/health".to_string()),
+                    id: "backend".to_string(),
+                    targets: vec![TargetConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: 3000,
+                        weight: Some(1),
+                        health_check_path: None,
+                    }],
+                    strategy: None,
+                    health_check: None,
                 },
                 UpstreamConfig {
-                    id: "service2".to_string(),
-                    host: "127.0.0.1".to_string(),
-                    port: 3001,
-                    weight: 1,
-                    health_check_path: Some("/health".to_string()),
-                },
-                UpstreamConfig {
-                    id: "service3".to_string(),
-                    host: "127.0.0.1".to_string(),
-                    port: 3002,
-                    weight: 1,
-                    health_check_path: Some("/health".to_string()),
+                    id: "api".to_string(),
+                    targets: vec![TargetConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: 4000,
+                        weight: Some(1),
+                        health_check_path: None,
+                    }],
+                    strategy: None,
+                    health_check: None,
                 },
             ],
-            routes: Some(vec![
+            servers: vec![],
+        };
+
+        let server = ServerConfig {
+            id: "test-server".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            port: 8080,
+            routes: vec![
                 RouteConfig {
-                    domain: "service-1.home.arpa".to_string(),
-                    upstream_ids: vec!["service1".to_string()],
-                    load_balancer_strategy: None,
+                    domains: Some(vec!["api.example.com".to_string()]),
+                    paths: Some(vec!["/api".to_string()]),
+                    upstream: "api".to_string(),
                 },
                 RouteConfig {
-                    domain: "service-2.home.arpa".to_string(),
-                    upstream_ids: vec!["service2".to_string()],
-                    load_balancer_strategy: Some(LoadBalancerStrategy::Random),
+                    domains: Some(vec!["backend.example.com".to_string()]),
+                    paths: None,
+                    upstream: "backend".to_string(),
                 },
-            ]),
-        }
+                RouteConfig {
+                    domains: None,
+                    paths: Some(vec!["/fallback".to_string()]),
+                    upstream: "backend".to_string(),
+                },
+            ],
+        };
+
+        (config, server)
     }
 
-    #[tokio::test]
-    async fn test_domain_routing() {
-        let config = create_test_config();
-        let router = DomainRouter::new(&config);
+    #[test]
+    fn test_router_creation() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
 
-        let (_, upstream) = router
-            .route_request(Some("service-1.home.arpa"))
-            .await
-            .unwrap();
-        assert!(upstream.is_some());
-        assert_eq!(upstream.unwrap().id, "service1");
-
-        let (_, upstream) = router
-            .route_request(Some("service-2.home.arpa"))
-            .await
-            .unwrap();
-        assert!(upstream.is_some());
-        assert_eq!(upstream.unwrap().id, "service2");
+        assert_eq!(router.upstreams.len(), 2);
+        assert_eq!(router.routes.len(), 3);
+        assert!(router.has_healthy_targets());
     }
 
-    #[tokio::test]
-    async fn test_default_routing() {
-        let config = create_test_config();
-        let router = DomainRouter::new(&config);
+    #[test]
+    fn test_domain_routing() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
 
-        let (_, upstream) = router
-            .route_request(Some("unknown.domain.com"))
-            .await
-            .unwrap();
-        assert!(upstream.is_some());
+        let result = router.route_request(Some("api.example.com"), "/api/users");
+        assert!(result.is_some());
+        let (target, prefix) = result.unwrap();
+        assert_eq!(target.port, 4000);
+        assert_eq!(prefix, Some("/api".to_string()));
 
-        let upstream = upstream.unwrap();
-        assert!(["service1", "service2", "service3"].contains(&upstream.id.as_str()));
+        let result = router.route_request(Some("backend.example.com"), "/anything");
+        assert!(result.is_some());
+        let (target, prefix) = result.unwrap();
+        assert_eq!(target.port, 3000);
+        assert_eq!(prefix, None);
     }
 
-    #[tokio::test]
-    async fn test_no_host_header() {
-        let config = create_test_config();
-        let router = DomainRouter::new(&config);
+    #[test]
+    fn test_path_routing() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
 
-        let (_, upstream) = router.route_request(None).await.unwrap();
-        assert!(upstream.is_some());
+        let result = router.route_request(Some("unknown.example.com"), "/fallback/test");
+        assert!(result.is_some());
+        let (target, prefix) = result.unwrap();
+        assert_eq!(target.port, 3000);
+        assert_eq!(prefix, Some("/fallback".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_upstream_status_update() {
-        let config = create_test_config();
-        let router = DomainRouter::new(&config);
+    #[test]
+    fn test_combined_domain_and_path_routing() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
 
-        router.update_upstream_status("service1", false).await;
+        let result = router.route_request(Some("api.example.com"), "/api/test");
+        assert!(result.is_some());
+        let (target, prefix) = result.unwrap();
+        assert_eq!(target.port, 4000);
+        assert_eq!(prefix, Some("/api".to_string()));
 
-        let (_, upstream) = router
-            .route_request(Some("service-1.home.arpa"))
-            .await
-            .unwrap();
-        assert!(upstream.is_none());
+        let result = router.route_request(Some("api.example.com"), "/other");
+        assert!(result.is_some());
     }
 
-    #[tokio::test]
-    async fn test_connection_tracking() {
-        let config = create_test_config();
-        let router = DomainRouter::new(&config);
+    #[test]
+    fn test_no_match_returns_none() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
 
-        router
-            .increment_connections("service1", Some("service-1.home.arpa"))
-            .await;
-        router
-            .decrement_connections("service1", Some("service-1.home.arpa"))
-            .await;
+        let result = router.route_request(Some("unknown.com"), "/unknown");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_router_stats() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
+
+        let stats = router.stats();
+        assert_eq!(stats.total_upstreams, 2);
+        assert_eq!(stats.total_routes, 3);
+        assert_eq!(stats.upstream_stats.len(), 2);
+    }
+
+    #[test]
+    fn test_find_target() {
+        let (config, server) = create_test_config();
+        let router = Router::new(&config, &server);
+
+        let target = router.find_target("127.0.0.1:3000");
+        assert!(target.is_some());
+        assert_eq!(target.unwrap().id, "127.0.0.1:3000");
+
+        let missing_target = router.find_target("nonexistent:9999");
+        assert!(missing_target.is_none());
     }
 }

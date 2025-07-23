@@ -1,192 +1,100 @@
-use crate::config::Config;
-use crate::health_check::HealthChecker;
-use crate::load_balancer::Upstream;
-use crate::router::DomainRouter;
-use anyhow::Result;
+use crate::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
-pub struct ReverseProxy {
-    config: Config,
-    router: Arc<DomainRouter>,
+#[derive(Debug, Clone)]
+pub struct ProxyHandler {
+    client: reqwest::Client,
 }
 
-impl ReverseProxy {
-    pub async fn new(config: Config) -> Result<Self> {
-        let router = Arc::new(DomainRouter::new(&config));
+impl ProxyHandler {
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client");
 
-        Ok(Self { config, router })
+        Self { client }
     }
 
-    pub async fn start(self) -> Result<()> {
-        let addr = SocketAddr::new(
-            self.config.proxy.bind_address.parse()?,
-            self.config.proxy.port,
-        );
-
-        info!("Starting reverse proxy on {}", addr);
-
-        if let Some(health_check_config) = &self.config.load_balancer.health_check {
-            let health_checker =
-                HealthChecker::new(health_check_config.clone(), self.router.clone());
-            tokio::spawn(async move {
-                health_checker.start().await;
-            });
-        }
-
-        let proxy = Arc::new(self);
-
-        let listener = TcpListener::bind(addr).await?;
-        info!("Listening on http://{}", addr);
-
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-            let proxy = proxy.clone();
-
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(
-                        io,
-                        service_fn(move |req| {
-                            let proxy = proxy.clone();
-                            async move { proxy.handle_request(req).await }
-                        }),
-                    )
-                    .await
-                {
-                    error!("Error serving connection: {:?}", err);
-                }
-            });
-        }
-    }
-
-    async fn handle_request(
+    pub async fn handle_request(
         &self,
         req: Request<Incoming>,
+        router: Arc<Router>,
+        _server_id: String,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
-        debug!("Received {} request to {}", req.method(), req.uri().path());
+        debug!("Handling {} request to {}", req.method(), req.uri().path());
 
-        let host_header = req
-            .headers()
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .map(|h| h.to_string());
+        let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+        let path = req.uri().path();
 
-        let (_load_balancer, upstream) =
-            match self.router.route_request(host_header.as_deref()).await {
-                Some((lb, upstream_opt)) => match upstream_opt {
-                    Some(upstream) => (lb, upstream),
-                    None => {
-                        warn!(
-                            "No healthy upstreams available for domain: {:?}",
-                            host_header
-                        );
-                        return Ok(Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Full::new(Bytes::from("Service Unavailable")))
-                            .unwrap());
-                    }
-                },
-                None => {
-                    warn!("Failed to route request for domain: {:?}", host_header);
-                    return Ok(Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(Full::new(Bytes::from("Service Unavailable")))
-                        .unwrap());
-                }
-            };
+        let (target, matched_prefix) = match router.route_request(host, path) {
+            Some(result) => result,
+            None => {
+                warn!(
+                    "No matching route found for host: {:?}, path: {}",
+                    host, path
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::from("No matching route found")))
+                    .unwrap());
+            }
+        };
 
-        debug!(
-            "Routing request for domain {:?} to upstream {}",
-            host_header, upstream.id
+        debug!("Routing request to target: {}, matched prefix: {:?}", target.id, matched_prefix);
+
+        let target_path = if let Some(prefix) = matched_prefix {
+            path.strip_prefix(&prefix).unwrap_or(path)
+        } else {
+            path
+        };
+
+        let target_url = format!(
+            "http://{}:{}{}{}",
+            target.host,
+            target.port,
+            target_path,
+            req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default()
         );
 
-        let upstream_id = upstream.id.clone();
-        self.router
-            .increment_connections(&upstream_id, host_header.as_deref())
-            .await;
+        debug!("Proxying to: {}", target_url);
 
-        let result = self.proxy_request(req, &upstream).await;
-
-        self.router
-            .decrement_connections(&upstream_id, host_header.as_deref())
-            .await;
-
-        result
+        match self.do_proxy_request(req, &target_url).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                warn!("Proxy request failed: {}", e);
+                Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Full::new(Bytes::from("Bad Gateway")))
+                    .unwrap())
+            }
+        }
     }
 
-    async fn proxy_request(
+    async fn do_proxy_request(
         &self,
-        mut req: Request<Incoming>,
-        upstream: &Upstream,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("/");
-        let upstream_uri = format!(
-            "http://{}:{}{}",
-            upstream.host, upstream.port, path_and_query
-        );
-
-        debug!("Proxying request to {}", upstream_uri);
-
-        let uri = match upstream_uri.parse() {
-            Ok(uri) => uri,
-            Err(e) => {
-                error!("Failed to parse upstream URI: {}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Bad Request")))
-                    .unwrap());
-            }
-        };
-
+        req: Request<Incoming>,
+        target_url: &str,
+    ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
         let method = req.method().clone();
-        let headers_map = req.headers().clone();
-
-        *req.uri_mut() = uri;
-
-        let headers = req.headers_mut();
-        headers.remove("connection");
-        headers.remove("proxy-connection");
-        headers.remove("te");
-        headers.remove("trailers");
-        headers.remove("upgrade");
-
+        let headers = req.headers().clone();
+        
         let body_bytes = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                error!("Failed to read request body: {}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Bad Request")))
-                    .unwrap());
-            }
+            Err(e) => return Err(Box::new(e)),
         };
 
-        let client = reqwest::Client::new();
+        let mut request_builder = self.client.request(method, target_url);
 
-        let mut request_builder = client.request(method, &upstream_uri);
-
-        for (name, value) in headers_map.iter() {
-            if let Ok(header_name) =
-                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
-            {
-                if let Ok(header_value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-                {
-                    request_builder = request_builder.header(header_name, header_value);
+        for (name, value) in headers.iter() {
+            if name != "host" {
+                if let Ok(value_str) = value.to_str() {
+                    request_builder = request_builder.header(name, value_str);
                 }
             }
         }
@@ -195,108 +103,25 @@ impl ReverseProxy {
             request_builder = request_builder.body(body_bytes.to_vec());
         }
 
-        match request_builder.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_bytes = match response.bytes().await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        error!("Failed to read response body: {}", e);
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Full::new(Bytes::from("Bad Gateway")))
-                            .unwrap());
-                    }
-                };
+        let response = request_builder.send().await?;
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let response_body = response.bytes().await?;
 
-                let mut response_builder = Response::builder().status(status.as_u16());
-
-                for (name, value) in headers.iter() {
-                    if name != "connection"
-                        && name != "proxy-connection"
-                        && name != "te"
-                        && name != "trailers"
-                        && name != "upgrade"
-                    {
-                        response_builder = response_builder.header(name, value);
-                    }
-                }
-
-                Ok(response_builder.body(Full::new(body_bytes)).unwrap())
-            }
-            Err(e) => {
-                error!("Failed to proxy request to upstream {}: {}", upstream.id, e);
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from("Bad Gateway")))
-                    .unwrap())
-            }
+        let mut response_builder = Response::builder().status(status);
+        
+        for (name, value) in response_headers.iter() {
+            response_builder = response_builder.header(name, value);
         }
+
+        Ok(response_builder
+            .body(Full::new(response_body))
+            .unwrap())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{
-        HealthCheckConfig, LoadBalancerConfig, LoadBalancerStrategy, ProxyConfig, UpstreamConfig,
-    };
-
-    #[tokio::test]
-    async fn test_reverse_proxy_creation() {
-        let config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 30,
-                    timeout_seconds: 5,
-                    expected_status: 200,
-                }),
-            },
-            upstreams: vec![UpstreamConfig {
-                id: "test".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 3000,
-                weight: 1,
-                health_check_path: Some("/health".to_string()),
-            }],
-            routes: None,
-        };
-
-        let proxy = ReverseProxy::new(config).await;
-        assert!(proxy.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_proxy_request_invalid_upstream() {
-        let config = Config {
-            proxy: ProxyConfig {
-                bind_address: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            load_balancer: LoadBalancerConfig {
-                strategy: LoadBalancerStrategy::RoundRobin,
-                health_check: Some(HealthCheckConfig {
-                    interval_seconds: 30,
-                    timeout_seconds: 5,
-                    expected_status: 200,
-                }),
-            },
-            upstreams: vec![UpstreamConfig {
-                id: "test".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 65535,
-                weight: 1,
-                health_check_path: Some("/health".to_string()),
-            }],
-            routes: None,
-        };
-
-        let _proxy = ReverseProxy::new(config).await.unwrap();
+impl Default for ProxyHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }

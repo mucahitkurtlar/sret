@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use sret::{config::Config, proxy::ReverseProxy};
+use sret::{config::Config, server::Server};
 use std::path::PathBuf;
-use tracing::{Level, info};
+use tracing::{Level, info, error};
 
 #[derive(Parser, Debug)]
 #[command(name = "sret")]
@@ -23,8 +23,28 @@ async fn main() -> Result<()> {
 
     let config = Config::from_file(&args.config)?;
 
-    let proxy = ReverseProxy::new(config).await?;
-    proxy.start().await?;
+    let mut tasks = Vec::new();
+    
+    for server_config in &config.servers {
+        let server = Server::new(&config, server_config);
+        let task = tokio::spawn(async move {
+            if let Err(e) = server.start().await {
+                error!("Server {} failed: {}", server.id, e);
+            }
+        });
+        tasks.push(task);
+    }
+
+    if tasks.is_empty() {
+        error!("No servers configured!");
+        return Ok(());
+    }
+
+    info!("Started {} server(s)", tasks.len());
+
+    for task in tasks {
+        let _ = task.await;
+    }
 
     Ok(())
 }
