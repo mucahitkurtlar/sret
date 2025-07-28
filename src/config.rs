@@ -56,12 +56,19 @@ pub struct ServerConfig {
     pub port: u16,
     pub routes: Vec<RouteConfig>,
     pub tls: Option<TlsConfig>,
+    pub cache: Option<CacheConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub cert_path: String,
     pub key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    pub max_size: usize,
+    pub default_ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +149,7 @@ mod tests {
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
                 tls: None,
+                cache: None,
                 routes: vec![RouteConfig {
                     domains: Some(vec!["example.com".to_string()]),
                     paths: None,
@@ -172,6 +180,7 @@ mod tests {
                 bind_address: "127.0.0.1".to_string(),
                 port: 8080,
                 tls: None,
+                cache: None,
                 routes: vec![RouteConfig {
                     domains: Some(vec!["example.com".to_string()]),
                     paths: None,

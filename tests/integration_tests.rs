@@ -89,6 +89,7 @@ fn create_test_config() -> Config {
                     upstream: "console".to_string(),
                 },
             ],
+            cache: None,
         }],
     }
 }

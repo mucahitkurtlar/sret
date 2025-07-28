@@ -1,3 +1,4 @@
+use crate::cache::{ResponseCache, generate_cache_key, is_cacheable_method};
 use crate::router::Router;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -26,8 +27,33 @@ impl ProxyHandler {
         req: Request<Incoming>,
         router: Arc<Router>,
         _server_id: String,
+        cache: Option<Arc<ResponseCache>>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         debug!("Handling {} request to {}", req.method(), req.uri().path());
+
+        let cache_key = if cache.is_some() {
+            if is_cacheable_method(req.method()) {
+                let path = req.uri().path();
+                let query = req.uri().query();
+                Some(generate_cache_key(
+                    req.method().as_str(),
+                    path,
+                    req.headers(),
+                    query,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let (Some(cache), Some(key)) = (&cache, &cache_key) {
+            if let Some(cached_response) = cache.get(key, req.headers()) {
+                debug!("Serving cached response for {}", key);
+                return Ok(cached_response);
+            }
+        }
 
         let host = req.headers().get("host").and_then(|h| h.to_str().ok());
         let path = req.uri().path();
@@ -70,7 +96,10 @@ impl ProxyHandler {
 
         debug!("Proxying to: {}", target_url);
 
-        match self.do_proxy_request(req, &target_url).await {
+        match self
+            .do_proxy_request(req, &target_url, cache.as_ref(), cache_key.as_ref())
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) => {
                 warn!("Proxy request failed: {}", e);
@@ -86,6 +115,8 @@ impl ProxyHandler {
         &self,
         req: Request<Incoming>,
         target_url: &str,
+        cache: Option<&Arc<ResponseCache>>,
+        cache_key: Option<&String>,
     ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
         let method = req.method().clone();
         let headers = req.headers().clone();
@@ -120,7 +151,21 @@ impl ProxyHandler {
             response_builder = response_builder.header(name, value);
         }
 
-        Ok(response_builder.body(Full::new(response_body)).unwrap())
+        let final_response = response_builder.body(Full::new(response_body)).unwrap();
+
+        if let (Some(cache), Some(key)) = (cache, cache_key) {
+            let cache_response = final_response.clone();
+            let cache_key_owned = key.clone();
+            let cache_clone = cache.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = cache_clone.put(cache_key_owned, cache_response).await {
+                    warn!("Failed to cache response: {}", e);
+                }
+            });
+        }
+
+        Ok(final_response)
     }
 }
 

@@ -246,6 +246,7 @@ mod tests {
                     upstream: "backend".to_string(),
                 },
             ],
+            cache: None,
         };
 
         (config, server)

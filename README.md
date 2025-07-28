@@ -1,6 +1,6 @@
-# sret - Rust Reverse Proxy
+# sret
 
-sret is a high-performance Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, HTTPS/TLS termination, and comprehensive health monitoring.
+sret is a Layer 7 reverse proxy written in Rust, featuring advanced routing, load balancing, HTTPS/TLS termination, response caching, and comprehensive health monitoring.
 
 ## Features
 
@@ -8,6 +8,7 @@ sret is a high-performance Layer 7 reverse proxy written in Rust, featuring adva
 - **HTTPS/TLS Support**: Optional SSL/TLS termination with certificate configuration
 - **Advanced Routing**: Domain and path-based routing with flexible matching
 - **Load Balancing**: Four algorithms (Round Robin, Least Connections, Random, Weighted Round Robin)
+- **HTTP Response Caching**: In-memory caching with TTL and LRU eviction (partially implemented)
 - **Health Monitoring**: Automatic upstream health checking with configurable intervals
 - **Path Rewriting**: Automatic path prefix stripping for clean backend requests
 - **Configuration-Driven**: YAML-based configuration with validation
@@ -93,6 +94,9 @@ servers:
           - "/ui"
           - "/dashboard"
         upstream: "ui"
+    cache:
+      max_size: 1000
+      default_ttl_seconds: 10
 ```
 
 ## Architecture
@@ -265,6 +269,41 @@ servers:
         upstream: "backend"
 ```
 
+## HTTP Response Caching
+
+> [!WARNING]  
+> This feature is partially implemented and may not be fully functional yet.
+
+sret provides intelligent HTTP response caching to improve performance and reduce upstream load:
+
+```yaml
+servers:
+  - id: "cached-server"
+    bind_address: "127.0.0.1"
+    port: 8080
+    cache:
+      max_size: 5000 # Store up to 5000 cached responses
+      default_ttl_seconds: 30 # Cache for 30 seconds by default
+    routes:
+      - paths: ["/api"]
+        upstream: "backend"
+```
+
+**Caching Features**:
+
+- **LRU Eviction**: Least Recently Used cache eviction when max_size is reached
+- **TTL Support**: Time-to-live based expiration with configurable defaults
+- **Cache-Control Respect**: Honors max-age, no-cache, and no-store directives
+- **Cache Metrics**: Built-in hit/miss ratio tracking and cache size monitoring
+
+**Cache Behavior**:
+
+- Only GET and HEAD requests are cached by default
+- Cache keys include HTTP method, host, path, query parameters, and some headers
+- Responses with Cache-Control: no-cache or no-store are never cached
+- Cache entries are automatically expired based on TTL
+- Cache is per-server instance and stored in memory
+
 ## Testing
 
 For detailed testing information, see [TESTING.md](TESTING.md).
@@ -380,6 +419,9 @@ servers:
     tls: # Optional: TLS/HTTPS configuration
       cert_path: "string" # Path to PEM certificate file
       key_path: "string" # Path to PEM private key file
+    cache: # Optional: HTTP response caching configuration
+      max_size: number # Maximum number of cached responses
+      default_ttl_seconds: number # Default cache TTL in seconds
     routes: # List of routing rules
       - domains: ["string"] # Optional: Domain matching
         paths: ["string"] # Optional: Path prefix matching

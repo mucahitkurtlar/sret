@@ -82,6 +82,7 @@ fn create_performance_config() -> Config {
                     upstream: "backend".to_string(),
                 },
             ],
+            cache: None,
         }],
     }
 }
