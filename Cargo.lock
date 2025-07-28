@@ -1484,6 +1484,7 @@ dependencies = [
  "anyhow",
  "clap",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "rand",

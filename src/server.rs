@@ -1,3 +1,4 @@
+use crate::cache::ResponseCache;
 use crate::config::{Config, ServerConfig};
 use crate::health_check::{HealthCheckManager, HealthChecker};
 use crate::proxy::ProxyHandler;
@@ -10,6 +11,7 @@ use rustls_pemfile::{certs, private_key};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
@@ -22,6 +24,7 @@ pub struct Server {
     pub proxy_handler: Arc<ProxyHandler>,
     pub health_manager: Option<HealthCheckManager>,
     pub tls_acceptor: Option<TlsAcceptor>,
+    pub cache: Option<Arc<ResponseCache>>,
 }
 
 impl Server {
@@ -72,6 +75,13 @@ impl Server {
             None
         };
 
+        let cache = server_config.cache.as_ref().map(|cache_config| {
+            Arc::new(ResponseCache::new(
+                cache_config.max_size,
+                Duration::from_secs(cache_config.default_ttl_seconds),
+            ))
+        });
+
         Self {
             id: server_config.id.clone(),
             bind_address: server_config.bind_address.clone(),
@@ -80,6 +90,7 @@ impl Server {
             proxy_handler,
             health_manager,
             tls_acceptor,
+            cache,
         }
     }
 
@@ -133,13 +144,19 @@ impl Server {
                     let server_id = server_id.clone();
                     let tls_acceptor = tls_acceptor.clone();
 
+                    let cache = self.cache.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req| {
                             let router = router.clone();
                             let proxy_handler = proxy_handler.clone();
                             let server_id = server_id.clone();
+                            let cache = cache.clone();
 
-                            async move { proxy_handler.handle_request(req, router, server_id).await }
+                            async move {
+                                proxy_handler
+                                    .handle_request(req, router, server_id, cache)
+                                    .await
+                            }
                         });
 
                         if let Some(acceptor) = tls_acceptor {
@@ -257,6 +274,7 @@ mod tests {
                 paths: None,
                 upstream: "backend".to_string(),
             }],
+            cache: None,
         };
 
         (config, server_config)
@@ -315,6 +333,7 @@ mod tests {
                 paths: None,
                 upstream: "backend".to_string(),
             }],
+            cache: None,
         };
 
         let server = Server::new(&config, &server_config);
